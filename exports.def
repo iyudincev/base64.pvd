@@ -1,0 +1,10 @@
+LIBRARY "Base64"
+EXPORTS
+    pvdInit
+    pvdExit
+    pvdPluginInfo
+    pvdFileOpen
+    pvdFileClose
+    pvdPageInfo
+    pvdPageDecode
+    pvdPageFree
