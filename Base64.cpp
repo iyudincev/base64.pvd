@@ -65,9 +65,74 @@ std::vector<BYTE> DecodeBase64(const std::string& base64_str) {
   return DecodeBase64(base64_str.data(), base64_str.length());
 }
 
-bool HasAlphaChannel(Gdiplus::Bitmap *pBitmap) {
-    if (!pBitmap) return false;
-    return (pBitmap->GetPixelFormat() & PixelFormatAlpha) != 0;
+// Схема представления пикселей, в которую плагин декодирует изображение
+struct PvdPixelLayout {
+    UINT32               nBPP;         // выходной формат: 8 - палитровый, 24 - BGR, 32 - BGRA с альфа-каналом
+    bool                 hasAlpha;     // есть ли в данных прозрачность
+    bool                 isPaletted;   // вывод 8bpp + pPalette (нативная палитра, без прозрачности)
+    bool                 expandToBgra; // вывод 32bpp: расширяем 8bpp-индексы палитрой сами (GDI+ теряет альфу палитры)
+    Gdiplus::PixelFormat dstFormat;     // формат, в котором запрашиваем LockBits
+    std::vector<Gdiplus::ARGB> palette; // палитра источника, 0xAARRGGBB
+};
+
+// Определяет оптимальный формат вывода по пиксельному формату bitmap
+//  - индексированные 8bpp без прозрачности -> нативная палитра 8bpp
+//  - индексированные 8bpp с прозрачностью -> 32bpp BGRA (индексы расширяются палитрой собственноручно)
+//  - индексированные 1/4bpp с прозрачностью -> 24bpp (редкий случай, прозрачность теряется)
+//  - прочие -> 32bpp BGRA при наличии альфа-канала, иначе 24bpp BGR
+PvdPixelLayout AnalyzePixels(Gdiplus::Bitmap *pBitmap) {
+    PvdPixelLayout out = {};
+    if (!pBitmap) return out;
+
+    Gdiplus::PixelFormat fmt = pBitmap->GetPixelFormat();
+    if (fmt & PixelFormatIndexed) {
+        UINT palSize = pBitmap->GetPaletteSize();
+        if (palSize >= sizeof(Gdiplus::ColorPalette)) {
+            std::vector<BYTE> palBuf(palSize);
+            auto pal = reinterpret_cast<Gdiplus::ColorPalette*>(palBuf.data());
+            if (pBitmap->GetPalette(pal, palSize) == Gdiplus::Ok) {
+                UINT nColors = pal->Count;
+                out.palette.assign(pal->Entries, pal->Entries + nColors);
+                for (UINT i = 0; i < nColors && !out.hasAlpha; ++i) {
+                    if ((pal->Entries[i] & 0xFF000000) != 0xFF000000) out.hasAlpha = true;
+                }
+                if (out.hasAlpha) {
+                    if (fmt == PixelFormat8bppIndexed) {
+                        out.nBPP = 32;
+                        out.expandToBgra = true;
+                        out.dstFormat = PixelFormat8bppIndexed; // нативные индексы, без конвертации
+                    } else {
+                        // 1/4bpp с прозрачностью - редкий случай; конвертируем в RGB, прозрачность теряется
+                        out.hasAlpha = false;
+                        out.nBPP = 24;
+                        out.dstFormat = PixelFormat24bppRGB;
+                    }
+                } else if (nColors > 0 && fmt == PixelFormat8bppIndexed) {
+                    out.nBPP = 8;
+                    out.isPaletted = true;
+                    out.dstFormat = PixelFormat8bppIndexed; // без конвертации, нативные индексы
+                } else {
+                    out.nBPP = 24;
+                    out.dstFormat = PixelFormat24bppRGB;
+                }
+            }
+        }
+        if (out.nBPP == 0) {
+            // не удалось получить палитру - обычная конвертация в RGB
+            out.nBPP = 24;
+            out.dstFormat = PixelFormat24bppRGB;
+        }
+    } else {
+        out.hasAlpha = (fmt & PixelFormatAlpha) != 0;
+        if (out.hasAlpha) {
+            out.nBPP = 32;
+            out.dstFormat = PixelFormat32bppARGB;
+        } else {
+            out.nBPP = 24;
+            out.dstFormat = PixelFormat24bppRGB;
+        }
+    }
+    return out;
 }
 
 bool QuickCheckFormat(const BYTE *pBuf, size_t lBuf, const char **format) {
@@ -127,7 +192,7 @@ void __stdcall pvdPluginInfo(pvdInfoPlugin *pPluginInfo) {
     if (!pPluginInfo) return;
     pPluginInfo->Priority = 10;
     pPluginInfo->pName = "Base64-GDI+";
-    pPluginInfo->pVersion = "1.0";
+    pPluginInfo->pVersion = "1.1";
     pPluginInfo->pComments = "Decodes Base64 encoded images via GDI+";
 }
 
@@ -206,7 +271,7 @@ BOOL __stdcall pvdPageInfo(void *pContext, UINT32 iPage, pvdInfoPage *pPageInfo)
 
     pPageInfo->lWidth = context->pBitmap->GetWidth();
     pPageInfo->lHeight = context->pBitmap->GetHeight();
-    pPageInfo->nBPP = HasAlphaChannel(context->pBitmap) ? 32 : 24;
+    pPageInfo->nBPP = AnalyzePixels(context->pBitmap).nBPP;
     pPageInfo->lFrameTime = 0; // Значение по умолчанию (если статичное изображение)
 
     // Читаем задержку кадра из GIF метаданных
@@ -250,36 +315,73 @@ BOOL __stdcall pvdPageDecode(void *pContext, UINT32 iPage, pvdInfoDecode *pDecod
 
     UINT width = context->pBitmap->GetWidth();
     UINT height = context->pBitmap->GetHeight();
-    bool hasAlpha = HasAlphaChannel(context->pBitmap);
-    UINT bytesPerPixel = hasAlpha ? 4 : 3;
+    PvdPixelLayout layout = AnalyzePixels(context->pBitmap);
+    UINT32 nPaletteColors = static_cast<UINT32>(layout.palette.size());
+    UINT bytesPerPixel = layout.nBPP / 8; // 1 - 8bpp, 3 - 24bpp, 4 - 32bpp
     INT32 pitch = (width * bytesPerPixel + 3) & ~3;
 
     BYTE* pPixelBuffer = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, pitch * height));
     if (!pPixelBuffer) return FALSE;
 
+    // Нативная палитра (без альфы) для 8bpp вывода; формат PVD: UINT32 RRGGBB (данные BGR, little-endian)
+    UINT32* pPaletteBuffer = nullptr;
+    if (layout.isPaletted && nPaletteColors > 0) {
+        pPaletteBuffer = static_cast<UINT32*>(HeapAlloc(GetProcessHeap(), 0, nPaletteColors * sizeof(UINT32)));
+        if (!pPaletteBuffer) {
+            HeapFree(GetProcessHeap(), 0, pPixelBuffer);
+            return FALSE;
+        }
+        for (UINT32 i = 0; i < nPaletteColors; ++i) pPaletteBuffer[i] = layout.palette[i] & 0x00FFFFFF;
+    }
+
     Gdiplus::Rect rect(0, 0, width, height);
     Gdiplus::BitmapData bmpData;
 
-    Gdiplus::Status status = context->pBitmap->LockBits(&rect, Gdiplus::ImageLockModeRead,
-                                                        hasAlpha ? PixelFormat32bppARGB : PixelFormat24bppRGB,
-                                                        &bmpData);
+    Gdiplus::Status status = context->pBitmap->LockBits(&rect, Gdiplus::ImageLockModeRead, layout.dstFormat, &bmpData);
     if (status == Gdiplus::Ok) {
-        for (UINT y = 0; y < height; ++y) {
-            BYTE* pSrcRow = reinterpret_cast<BYTE*>(bmpData.Scan0) + (y * bmpData.Stride);
-            BYTE* pDstRow = pPixelBuffer + ((height - 1 - y) * pitch);
-            memcpy(pDstRow, pSrcRow, width * bytesPerPixel);
+        if (layout.expandToBgra) {
+            // Индексы с палитрой, содержащей альфу: GDI+ теряет альфу палитры при конвертации, поэтому расширяем сами
+            for (UINT y = 0; y < height; ++y) {
+                const BYTE* pIdxRow = reinterpret_cast<const BYTE*>(bmpData.Scan0) + (y * bmpData.Stride);
+                BYTE* pDstRow = pPixelBuffer + ((height - 1 - y) * pitch);
+                for (UINT x = 0; x < width; ++x) {
+                    BYTE idx = pIdxRow[x];
+                    Gdiplus::ARGB argb = (idx < nPaletteColors) ? layout.palette[idx] : 0x00000000;
+                    pDstRow[x * 4 + 0] = (BYTE)(argb & 0xFF);         // B
+                    pDstRow[x * 4 + 1] = (BYTE)((argb >>  8) & 0xFF); // G
+                    pDstRow[x * 4 + 2] = (BYTE)((argb >> 16) & 0xFF); // R
+                    pDstRow[x * 4 + 3] = (BYTE)((argb >> 24) & 0xFF); // A
+                }
+            }
+        } else {
+            for (UINT y = 0; y < height; ++y) {
+                BYTE* pSrcRow = reinterpret_cast<BYTE*>(bmpData.Scan0) + (y * bmpData.Stride);
+                BYTE* pDstRow = pPixelBuffer + ((height - 1 - y) * pitch);
+                memcpy(pDstRow, pSrcRow, width * bytesPerPixel);
+            }
         }
         context->pBitmap->UnlockBits(&bmpData);
 
+        // Если ни один пиксель не оказался полупрозрачным (GDI+ для GIF композитирует прозрачность
+        // на предыдущий кадр/фон и отдаёт полностью непрозрачные данные), не ставим флаг PVD_IDF_ALPHA
+        if (layout.hasAlpha && layout.nBPP == 32) {
+            bool anyTransparent = false;
+            for (size_t i = 3; i < (size_t)height * pitch; i += 4) {
+                if (pPixelBuffer[i] < 255) { anyTransparent = true; break; }
+            }
+            if (!anyTransparent) layout.hasAlpha = false;
+        }
+
         pDecodeInfo->pImage = pPixelBuffer;
-        pDecodeInfo->pPalette = nullptr;
-        pDecodeInfo->Flags = hasAlpha ? PVD_IDF_ALPHA : 0;
-        pDecodeInfo->nBPP = hasAlpha ? 32 : 24;
-        pDecodeInfo->nColorsUsed = 0;
+        pDecodeInfo->pPalette = pPaletteBuffer;
+        pDecodeInfo->Flags = layout.hasAlpha ? PVD_IDF_ALPHA : 0;
+        pDecodeInfo->nBPP = layout.nBPP;
+        pDecodeInfo->nColorsUsed = layout.isPaletted ? nPaletteColors : 0;
         pDecodeInfo->lImagePitch = -pitch;
         return TRUE;
     }
 
+    if (pPaletteBuffer) HeapFree(GetProcessHeap(), 0, pPaletteBuffer);
     HeapFree(GetProcessHeap(), 0, pPixelBuffer);
     return FALSE;
 }
@@ -288,5 +390,9 @@ void __stdcall pvdPageFree(void *pContext, pvdInfoDecode *pDecodeInfo) {
     if (pDecodeInfo && pDecodeInfo->pImage) {
         HeapFree(GetProcessHeap(), 0, pDecodeInfo->pImage);
         pDecodeInfo->pImage = nullptr;
+    }
+    if (pDecodeInfo && pDecodeInfo->pPalette) {
+        HeapFree(GetProcessHeap(), 0, pDecodeInfo->pPalette);
+        pDecodeInfo->pPalette = nullptr;
     }
 }
