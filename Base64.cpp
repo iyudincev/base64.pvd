@@ -65,6 +65,11 @@ std::vector<BYTE> DecodeBase64(const std::string& base64_str) {
   return DecodeBase64(base64_str.data(), base64_str.length());
 }
 
+bool HasAlphaChannel(Gdiplus::Bitmap *pBitmap) {
+    if (!pBitmap) return false;
+    return (pBitmap->GetPixelFormat() & PixelFormatAlpha) != 0;
+}
+
 bool QuickCheckFormat(const BYTE *pBuf, size_t lBuf, const char **format) {
     const size_t N_CHARS_DECODE = 20;
     if (lBuf < N_CHARS_DECODE) return false;
@@ -201,7 +206,7 @@ BOOL __stdcall pvdPageInfo(void *pContext, UINT32 iPage, pvdInfoPage *pPageInfo)
 
     pPageInfo->lWidth = context->pBitmap->GetWidth();
     pPageInfo->lHeight = context->pBitmap->GetHeight();
-    pPageInfo->nBPP = 24;
+    pPageInfo->nBPP = HasAlphaChannel(context->pBitmap) ? 32 : 24;
     pPageInfo->lFrameTime = 0; // Значение по умолчанию (если статичное изображение)
 
     // Читаем задержку кадра из GIF метаданных
@@ -245,29 +250,33 @@ BOOL __stdcall pvdPageDecode(void *pContext, UINT32 iPage, pvdInfoDecode *pDecod
 
     UINT width = context->pBitmap->GetWidth();
     UINT height = context->pBitmap->GetHeight();
-    INT32 pitch24 = (width * 3 + 3) & ~3;
+    bool hasAlpha = HasAlphaChannel(context->pBitmap);
+    UINT bytesPerPixel = hasAlpha ? 4 : 3;
+    INT32 pitch = (width * bytesPerPixel + 3) & ~3;
 
-    BYTE* pPixelBuffer = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, pitch24 * height));
+    BYTE* pPixelBuffer = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, pitch * height));
     if (!pPixelBuffer) return FALSE;
 
     Gdiplus::Rect rect(0, 0, width, height);
     Gdiplus::BitmapData bmpData;
 
-    Gdiplus::Status status = context->pBitmap->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat24bppRGB, &bmpData);
+    Gdiplus::Status status = context->pBitmap->LockBits(&rect, Gdiplus::ImageLockModeRead,
+                                                        hasAlpha ? PixelFormat32bppARGB : PixelFormat24bppRGB,
+                                                        &bmpData);
     if (status == Gdiplus::Ok) {
         for (UINT y = 0; y < height; ++y) {
             BYTE* pSrcRow = reinterpret_cast<BYTE*>(bmpData.Scan0) + (y * bmpData.Stride);
-            BYTE* pDstRow = pPixelBuffer + ((height - 1 - y) * pitch24);
-            memcpy(pDstRow, pSrcRow, width * 3);
+            BYTE* pDstRow = pPixelBuffer + ((height - 1 - y) * pitch);
+            memcpy(pDstRow, pSrcRow, width * bytesPerPixel);
         }
         context->pBitmap->UnlockBits(&bmpData);
 
         pDecodeInfo->pImage = pPixelBuffer;
-        pDecodeInfo->Flags = 0;
-        pDecodeInfo->nBPP = 24;
         pDecodeInfo->pPalette = nullptr;
+        pDecodeInfo->Flags = hasAlpha ? PVD_IDF_ALPHA : 0;
+        pDecodeInfo->nBPP = hasAlpha ? 32 : 24;
         pDecodeInfo->nColorsUsed = 0;
-        pDecodeInfo->lImagePitch = -pitch24;
+        pDecodeInfo->lImagePitch = -pitch;
         return TRUE;
     }
 
