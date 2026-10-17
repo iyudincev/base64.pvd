@@ -17,7 +17,7 @@ struct PvdContext {
     IStream*          pStream;
     Gdiplus::Bitmap*  pBitmap;
 
-    PvdContext() : hGlobal(NULL), pStream(NULL), pBitmap(NULL) {}
+    PvdContext() : hGlobal(nullptr), pStream(nullptr), pBitmap(nullptr) {}
 
     ~PvdContext() {
         if (pBitmap) delete pBitmap;
@@ -27,7 +27,7 @@ struct PvdContext {
 
 std::wstring Utf8ToWstring(const char* utf8Str) {
     if (!utf8Str) return L"";
-    int wchars_num = MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, NULL, 0);
+    int wchars_num = MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, nullptr, 0);
     if (wchars_num <= 0) return L"";
     std::wstring wstr(wchars_num - 1, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, &wstr[0], wchars_num);
@@ -81,10 +81,10 @@ bool QuickCheckFormat(const BYTE *pBuf, size_t lBuf, const char **format) {
 }
 
 bool ExtractRawData(const std::wstring& filePath, std::vector<BYTE>& outData) {
-    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
-    DWORD size = GetFileSize(hFile, NULL);
+    DWORD size = GetFileSize(hFile, nullptr);
     if (size == 0 || size == INVALID_FILE_SIZE) {
         CloseHandle(hFile);
         return false;
@@ -92,7 +92,7 @@ bool ExtractRawData(const std::wstring& filePath, std::vector<BYTE>& outData) {
 
     std::string buffer(size, '\0');
     DWORD read = 0;
-    if (!ReadFile(hFile, &buffer[0], size, &read, NULL) || read != size) {
+    if (!ReadFile(hFile, &buffer[0], size, &read, nullptr) || read != size) {
         CloseHandle(hFile);
         return false;
     }
@@ -105,7 +105,7 @@ ULONG_PTR g_GdiplusToken = 0;
 
 UINT32 __stdcall pvdInit(void) {
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-    if (Gdiplus::GdiplusStartup(&g_GdiplusToken, &gdiplusStartupInput, NULL) == Gdiplus::Ok) {
+    if (Gdiplus::GdiplusStartup(&g_GdiplusToken, &gdiplusStartupInput, nullptr) == Gdiplus::Ok) {
         return PVD_CURRENT_INTERFACE_VERSION;
     }
     return 0;
@@ -263,9 +263,9 @@ BOOL __stdcall pvdPageDecode(void *pContext, UINT32 iPage, pvdInfoDecode *pDecod
         context->pBitmap->UnlockBits(&bmpData);
 
         pDecodeInfo->pImage = pPixelBuffer;
-        pDecodeInfo->pPalette = NULL;
         pDecodeInfo->Flags = 0;
         pDecodeInfo->nBPP = 24;
+        pDecodeInfo->pPalette = nullptr;
         pDecodeInfo->nColorsUsed = 0;
         pDecodeInfo->lImagePitch = -pitch24;
         return TRUE;
@@ -278,6 +278,6 @@ BOOL __stdcall pvdPageDecode(void *pContext, UINT32 iPage, pvdInfoDecode *pDecod
 void __stdcall pvdPageFree(void *pContext, pvdInfoDecode *pDecodeInfo) {
     if (pDecodeInfo && pDecodeInfo->pImage) {
         HeapFree(GetProcessHeap(), 0, pDecodeInfo->pImage);
-        pDecodeInfo->pImage = NULL;
+        pDecodeInfo->pImage = nullptr;
     }
 }
